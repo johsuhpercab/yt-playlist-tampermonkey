@@ -1,0 +1,1173 @@
+// ==UserScript==
+// @name         YouTube - Keep Save to Playlist Popup Open (3 cols, DRAGGABLE, A-Z, TYPE-TO-SEARCH)
+// @namespace    http://tampermonkey.net/
+// @version      8.32
+// @description  3 cols. Draggable! A-Z Toggle. Ghost Searchbar (Ctrl+Backspace/A/X). + New Playlist button. Icon stays "Saved" via polling.
+// @author       Antigravity (Upgraded by Gemini, fixed by Claude)
+// @match        https://www.youtube.com/*
+// @match        https://youtube.com/*
+// @grant        GM_addStyle
+// @run-at       document-idle
+// ==/UserScript==
+
+(function () {
+    'use strict';
+
+    // ── CONFIGURACIÓN ─────────────────────────────────────────────
+    const WIDTH_3_COL = '700px';
+    const POPUP_MAX_HEIGHT = '80vh';
+    const GRID_GAP = '4px';
+    // ───────────────────────────────────────────────────────────────
+
+    let active = false;
+    let locked = new WeakSet();
+    const observers = [];
+    let lastTrigger = null;
+    let reopenCooldown = false;
+    let fallbackInterval = null;
+    let activePopup = null;
+    let activeStyle = null;
+    let activeContainer = null;
+    let activeScroller = null;
+    let pendingOpen = false;
+    let stopCooldown = false;
+    let wheelHandler = null;
+    let retryTimeout = null;
+    let pollFrame = null;
+    let sortObserver = null;
+    let navigationLockUntil = 0;
+    let iconLockInterval = null;   // ★ polling loop to force "Saved" icon
+
+    // Guardar preferencia de usuario
+    let isAlphabetical = localStorage.getItem('ytpk_sort_az') === 'true';
+    let searchQuery = '';
+
+    function setScriptActiveClass(active) {
+        document.body.classList.toggle('ytpk-active', active);
+    }
+
+    GM_addStyle(`
+        body.ytpk-active ytd-add-to-playlist-renderer:not([data-ytpk-ready]),
+        body.ytpk-active yt-sheet-view-model:not([data-ytpk-ready]) {
+            opacity: 0 !important;
+            visibility: hidden !important;
+            pointer-events: none !important;
+        }
+
+        .ytpk-close-btn, .ytpk-refresh-btn, .ytpk-sort-btn {
+            position: absolute;
+            top: 6px;
+            z-index: 9999999;
+            background: transparent;
+            color: #aaa;
+            border: none;
+            height: 28px;
+            line-height: 28px;
+            text-align: center;
+            cursor: pointer;
+            padding: 0;
+            transition: background 0.2s, color 0.2s;
+        }
+        .ytpk-close-btn, .ytpk-refresh-btn {
+            width: 28px;
+            border-radius: 50%;
+        }
+        .ytpk-close-btn { right: 6px; font-size: 18px; }
+        .ytpk-refresh-btn { right: 36px; font-size: 16px; }
+        .ytpk-sort-btn {
+            right: 68px;
+            font-size: 12px;
+            font-weight: bold;
+            padding: 0 10px;
+            border-radius: 14px;
+        }
+        .ytpk-new-btn {
+            position: fixed !important;
+            font-size: 20px;
+            width: 28px;
+            height: 28px;
+            line-height: 28px;
+            border-radius: 50%;
+            text-align: center;
+            background: transparent;
+            color: #aaa;
+            border: none;
+            cursor: pointer;
+            z-index: 2147483647 !important;
+            transition: background 0.2s, color 0.2s;
+        }
+        .ytpk-close-btn:hover, .ytpk-refresh-btn:hover, .ytpk-sort-btn:hover, .ytpk-new-btn:hover {
+            background: rgba(255,255,255,0.1);
+            color: #fff;
+        }
+        .ytpk-sort-btn.active {
+            background: rgba(255,255,255,0.25);
+            color: #fff;
+        }
+        .ytpk-search-box {
+            position: absolute;
+            top: 6px;
+            left: 16px;
+            background: rgba(0, 0, 0, 0.75);
+            color: #fff;
+            padding: 4px 12px;
+            border-radius: 16px;
+            font-family: Roboto, Arial, sans-serif;
+            font-size: 14px;
+            font-weight: bold;
+            z-index: 9999999;
+            display: none;
+            pointer-events: none;
+            border: 1px solid rgba(255,255,255,0.2);
+            box-shadow: 0 2px 10px rgba(0,0,0,0.5);
+            user-select: text;
+        }
+    `);
+
+    function isVisible(el) {
+        const r = el.getBoundingClientRect();
+        return r.width > 0 && r.height > 30 &&
+            el.style.display !== 'none' &&
+            !el.hasAttribute('hidden');
+    }
+
+    function getPopup() {
+        const specific = document.querySelector('ytd-add-to-playlist-renderer');
+        if (specific && isVisible(specific)) {
+            let el = specific;
+            while (el && el !== document.body) {
+                const tag = el.tagName?.toLowerCase() || '';
+                if (tag === 'tp-yt-paper-dialog' || tag === 'yt-bottom-sheet') return el;
+                el = el.parentElement || el.parentNode?.host;
+            }
+            return specific;
+        }
+        for (const el of document.querySelectorAll('yt-sheet-view-model, yt-bottom-sheet, tp-yt-paper-dialog')) {
+            if (!isVisible(el)) continue;
+            const t = el.textContent || '';
+            if (t.includes('Nueva lista') || t.includes('New playlist') ||
+                t.includes('Neue Playlist') || t.includes('Criar playlist') ||
+                t.includes('新しい再生リスト')) {
+                return el;
+            }
+        }
+        return null;
+    }
+
+    function hasPlaylistList(popup) {
+        return findPlaylistContainer(popup) !== null;
+    }
+
+    function findPlaylistContainer(root) {
+        const search = (node) => {
+            if (!node) return null;
+            if (node.tagName === 'YT-LIST-VIEW-MODEL') {
+                if (node.children?.length >= 2 || node.shadowRoot?.children?.length >= 2) return node;
+            }
+            if (node.id === 'playlists' || node.getAttribute?.('role') === 'list') {
+                if (node.children?.length >= 2) return node;
+            }
+            if (node.children?.length > 3 && node.tagName === 'DIV') {
+                const listItems = Array.from(node.children).filter(c =>
+                    c.getAttribute?.('role') === 'listitem' || c.tagName?.includes('YTD-')
+                );
+                if (listItems.length >= 2) return node;
+            }
+            if (node.shadowRoot) {
+                const found = search(node.shadowRoot);
+                if (found) return found;
+            }
+            for (const child of node.children || []) {
+                const found = search(child);
+                if (found) return found;
+            }
+            return null;
+        };
+        return search(root);
+    }
+
+    function findScroller(container) {
+        if (!container.shadowRoot) return container;
+        let best = null;
+        let maxHeight = 0;
+        const check = (node) => {
+            if (!node || node.nodeType !== 1) return false;
+            const style = getComputedStyle(node);
+            if (style.overflowY === 'auto' || style.overflowY === 'scroll') {
+                best = node;
+                return true;
+            }
+            const rect = node.getBoundingClientRect();
+            if (rect.height > maxHeight && node.children.length > 5) {
+                maxHeight = rect.height;
+                best = node;
+            }
+            for (const child of node.children || []) {
+                if (check(child)) return true;
+            }
+            return false;
+        };
+        for (const child of container.shadowRoot.children || []) {
+            if (check(child)) break;
+        }
+        return best || container;
+    }
+
+    function getGridContainer() {
+        if (!activeContainer) return null;
+        if (activeContainer.shadowRoot) {
+            return activeContainer.shadowRoot.querySelector('#items, #playlists, [role="list"]') || activeContainer;
+        }
+        return activeContainer.querySelector('#items, #playlists, [role="list"]') || activeContainer;
+    }
+
+    function removeBlur(el) {
+        if (!el) return;
+        el.style.setProperty('backdrop-filter', 'none', 'important');
+        el.style.setProperty('-webkit-backdrop-filter', 'none', 'important');
+        if (el.shadowRoot) {
+            el.shadowRoot.querySelectorAll('*').forEach(child => {
+                child.style?.setProperty('backdrop-filter', 'none', 'important');
+                child.style?.setProperty('-webkit-backdrop-filter', 'none', 'important');
+            });
+        }
+    }
+
+    function updateSearchUI() {
+        const box = activePopup?.querySelector('.ytpk-search-box');
+        if (!box) return;
+        if (searchQuery.length > 0) {
+            box.style.display = 'block';
+            box.textContent = '🔎 ' + searchQuery;
+        } else {
+            box.style.display = 'none';
+        }
+    }
+
+    const CREATE_TERMS = ['nueva lista', 'new playlist', 'neue playlist', 'criar playlist',
+                          '新しい再生リスト', 'create new', 'crear nueva'];
+
+    function searchForCreateItem(root) {
+        if (!root) return null;
+        function walk(node) {
+            if (!node) return null;
+            const children = Array.from(node.children || []).filter(n => n.nodeType === 1);
+            for (const child of children) {
+                const txt = (child.textContent || '').replace(/\s+/g, ' ').trim().toLowerCase();
+                if (CREATE_TERMS.some(t => txt.includes(t))) return child;
+                if (child.shadowRoot) {
+                    const found = walk(child.shadowRoot);
+                    if (found) return found;
+                }
+                const found = walk(child);
+                if (found) return found;
+            }
+            return null;
+        }
+        return walk(root);
+    }
+
+    function findCreateNewItem() {
+        if (activePopup) {
+            const found = searchForCreateItem(activePopup);
+            if (found) return found;
+            if (activePopup.shadowRoot) {
+                const found2 = searchForCreateItem(activePopup.shadowRoot);
+                if (found2) return found2;
+            }
+        }
+        return searchForCreateItem(document.body);
+    }
+
+    function polymerClick(el) {
+        if (!el) return;
+        function deepest(node) {
+            if (!node) return null;
+            const sr = node.shadowRoot;
+            if (!sr) return node;
+            const inner = sr.querySelector('button, [role="button"], tp-yt-paper-item, #item, #container');
+            return inner ? deepest(inner) : node;
+        }
+        const target = deepest(el);
+        const rect = target.getBoundingClientRect();
+        const cx = rect.left + rect.width / 2;
+        const cy = rect.top + rect.height / 2;
+        const opts = { bubbles: true, composed: true, cancelable: true, clientX: cx, clientY: cy };
+        for (const type of ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click']) {
+            target.dispatchEvent(new MouseEvent(type, opts));
+        }
+    }
+
+    // ★ Polling loop to force the toggle icon to stay "Saved"
+    function startIconLock() {
+        if (iconLockInterval) return; // already running
+        const force = () => {
+            // Try to find the toggle button
+            let toggle = document.querySelector('ytd-toggle-button-renderer[aria-label*="Save to playlist"]');
+            if (!toggle && lastTrigger && lastTrigger.tagName === 'YTD-TOGGLE-BUTTON-RENDERER') {
+                toggle = lastTrigger;
+            }
+            if (!toggle && lastTrigger) {
+                toggle = lastTrigger.querySelector('ytd-toggle-button-renderer');
+            }
+            if (toggle && (toggle.getAttribute('pressed') !== 'true' || toggle.pressed !== true)) {
+                try {
+                    toggle.pressed = true;
+                    toggle.setAttribute('pressed', 'true');
+                    toggle.setAttribute('aria-pressed', 'true');
+                } catch (_) {}
+            }
+        };
+        force(); // immediate
+        iconLockInterval = setInterval(force, 150);
+    }
+
+    function stopIconLock() {
+        if (iconLockInterval) {
+            clearInterval(iconLockInterval);
+            iconLockInterval = null;
+        }
+    }
+
+    // Listen for playlist item clicks to start the icon lock
+    function attachPlaylistClickMonitor(popup) {
+        const handler = (e) => {
+            const target = e.target.closest('ytd-playlist-add-to-option-renderer, ytd-playlist-renderer, [role="listitem"], tp-yt-paper-item');
+            if (!target) return;
+            // After a short delay, start forcing the icon
+            setTimeout(startIconLock, 100);
+        };
+        popup.addEventListener('click', handler, true);
+        popup._ytpkIconUpdater = handler;
+    }
+
+    function applySorting(gridContainer) {
+        if (!gridContainer) return;
+
+        const items = Array.from(gridContainer.children).filter(node => node.nodeType === 1);
+        if (items.length < 2) return;
+
+        const rawQuery = searchQuery.trim().toLowerCase();
+        const strippedQuery = rawQuery.replace(/\s+/g, '');
+
+        if (!isAlphabetical && !rawQuery) {
+            items.forEach(item => item.style.setProperty('order', '', 'important'));
+            return;
+        }
+
+        const mapped = items.map((item, originalIndex) => {
+            let text = '';
+            const titleNode = item.querySelector('[title]');
+            if (titleNode && titleNode.getAttribute('title')) {
+                text = titleNode.getAttribute('title');
+            } else if (item.shadowRoot) {
+                const shadowTitle = item.shadowRoot.querySelector('[title]');
+                if (shadowTitle && shadowTitle.getAttribute('title')) {
+                    text = shadowTitle.getAttribute('title');
+                }
+            }
+
+            if (!text) text = item.textContent || '';
+            text = text.replace(/[\n\r]+/g, ' ').replace(/\s{2,}/g, ' ').trim().toLowerCase();
+            const strippedText = text.replace(/\s+/g, '');
+
+            const isWatchLater = text.includes('watch later') || text.includes('ver más tarde') || text.includes('ver mas tarde');
+            const isCreateNew = text.includes('crear nueva') || text.includes('create new') || text.includes('nueva lista') || text.includes('new playlist') || item.tagName.includes('CREATE');
+
+            return { item, text, strippedText, isWatchLater, isCreateNew, originalIndex };
+        });
+
+        mapped.sort((a, b) => {
+            if (strippedQuery) {
+                const aMatch = a.strippedText.includes(strippedQuery);
+                const bMatch = b.strippedText.includes(strippedQuery);
+                if (aMatch && !bMatch) return -1;
+                if (!aMatch && bMatch) return 1;
+            }
+            if (a.isWatchLater && !b.isWatchLater) return -1;
+            if (!a.isWatchLater && b.isWatchLater) return 1;
+            if (a.isCreateNew && !b.isCreateNew) return 1;
+            if (!a.isCreateNew && b.isCreateNew) return -1;
+            if (isAlphabetical) {
+                return a.text.localeCompare(b.text);
+            } else {
+                return a.originalIndex - b.originalIndex;
+            }
+        });
+
+        mapped.forEach((obj, idx) => {
+            obj.item.style.setProperty('order', (idx + 1).toString(), 'important');
+        });
+    }
+
+    function makeDraggable(popup) {
+        if (popup.dataset.ytpkDraggable) return;
+        popup.dataset.ytpkDraggable = 'true';
+
+        let isDragging = false;
+        let startX, startY, initialLeft, initialTop;
+        const DRAG_THRESHOLD = 6;
+
+        popup.style.cursor = 'grab';
+
+        popup.addEventListener('mousedown', (e) => {
+            if (e.button !== 0) return;
+            const rect = popup.getBoundingClientRect();
+            if (e.clientY > rect.top + 40) return;
+            startX = e.clientX;
+            startY = e.clientY;
+            initialLeft = rect.left;
+            initialTop = rect.top;
+            isDragging = false;
+            popup._ytpkPendingDrag = true;
+        });
+
+        document.addEventListener('mousemove', (e) => {
+            if (!popup._ytpkPendingDrag && !isDragging) return;
+            const dx = e.clientX - startX;
+            const dy = e.clientY - startY;
+
+            if (!isDragging) {
+                if (Math.sqrt(dx*dx + dy*dy) < DRAG_THRESHOLD) return;
+                isDragging = true;
+                popup._ytpkPendingDrag = false;
+                popup.style.right = 'auto';
+                popup.style.bottom = 'auto';
+                popup.style.transform = 'none';
+                popup.style.left = initialLeft + 'px';
+                popup.style.top = initialTop + 'px';
+                popup.style.cursor = 'grabbing';
+                popup.style.transition = 'none';
+            }
+
+            popup.style.left = (initialLeft + dx) + 'px';
+            popup.style.top  = (initialTop  + dy) + 'px';
+            e.preventDefault();
+        });
+
+        document.addEventListener('mouseup', () => {
+            popup._ytpkPendingDrag = false;
+            if (!isDragging) return;
+            isDragging = false;
+            popup.style.cursor = 'grab';
+        });
+    }
+
+    function applyColumnLayout() {
+        const popup = activePopup;
+        if (!popup || !activeContainer) return false;
+
+        popup.dataset.ytpkPopup = 'true';
+
+        const scroller = activeScroller || (activeScroller = findScroller(activeContainer));
+        const cols = 3;
+
+        if (activeStyle) {
+            activeStyle.remove();
+            activeStyle = null;
+        }
+
+        const currentLeft = popup.style.left;
+        const currentTop = popup.style.top;
+        const currentRight = popup.style.right;
+        const currentPos = popup.style.position;
+
+        popup.style.marginTop = '0px';
+        popup.style.marginLeft = '0px';
+
+        if (currentPos === 'fixed' && currentLeft && currentLeft !== 'auto') {
+            popup.style.position = 'fixed';
+            popup.style.left = currentLeft;
+            popup.style.top = currentTop;
+            popup.style.right = 'auto';
+            popup.style.transform = 'none';
+        } else if (currentPos === 'fixed' && currentRight && currentRight !== 'auto') {
+            popup.style.position = 'fixed';
+            popup.style.right = currentRight;
+            popup.style.top = currentTop;
+            popup.style.left = 'auto';
+            popup.style.transform = 'none';
+        } else {
+            popup.style.position = 'fixed';
+            popup.style.top = '12vh';
+            popup.style.right = '24px';
+            popup.style.left = 'auto';
+            popup.style.transform = 'none';
+        }
+        popup.style.zIndex = '999999';
+
+        let parent = activeContainer.parentElement || activeContainer.parentNode?.host;
+        while (parent && parent !== popup && popup.contains(parent)) {
+            parent.style.setProperty('width', '100%', 'important');
+            parent.style.setProperty('max-width', 'none', 'important');
+            parent.style.setProperty('box-sizing', 'border-box', 'important');
+            parent = parent.parentElement || (parent.parentNode?.host || null);
+        }
+
+        removeBlur(popup);
+        const scrim = document.querySelector('tp-yt-iron-overlay-backdrop, .yt-sheet-scrim');
+        if (scrim) removeBlur(scrim);
+
+        popup.style.width = WIDTH_3_COL;
+        popup.style.maxWidth = '96vw';
+        popup.style.maxHeight = POPUP_MAX_HEIGHT;
+        popup.style.boxSizing = 'border-box';
+        popup.style.backgroundColor = 'var(--yt-spec-base-background, #212121)';
+        popup.style.overflow = 'hidden';
+
+        scroller.style.setProperty('max-height', 'calc(' + POPUP_MAX_HEIGHT + ' - 60px)', 'important');
+        scroller.style.setProperty('overflow-y', 'auto', 'important');
+        scroller.style.setProperty('overflow-x', 'hidden', 'important');
+        scroller.style.setProperty('width', '100%', 'important');
+        scroller.style.setProperty('box-sizing', 'border-box', 'important');
+
+        activeContainer.style.setProperty('width', '100%', 'important');
+        activeContainer.style.setProperty('max-width', 'none', 'important');
+        activeContainer.style.setProperty('box-sizing', 'border-box', 'important');
+
+        const shadowCss = `
+            :host {
+                display: grid !important;
+                grid-template-columns: repeat(${cols}, 1fr) !important;
+                gap: ${GRID_GAP} !important;
+                width: 100% !important;
+                max-width: none !important;
+                box-sizing: border-box !important;
+                padding: 8px !important;
+                align-content: start !important;
+            }
+            :host > * {
+                min-width: 0 !important;
+                overflow: hidden !important;
+                width: 100% !important;
+            }
+            #items, #playlists, [role="list"] {
+                display: grid !important;
+                grid-template-columns: repeat(${cols}, 1fr) !important;
+                gap: ${GRID_GAP} !important;
+                width: 100% !important;
+                max-width: none !important;
+                align-content: start !important;
+                box-sizing: border-box !important;
+            }
+            #items > *, #playlists > *, [role="list"] > * {
+                min-width: 0 !important;
+                overflow: hidden !important;
+            }
+        `;
+
+        const globalScopedCss = `
+            [data-ytpk-popup] #items,
+            [data-ytpk-popup] #playlists,
+            [data-ytpk-popup] [role="list"] {
+                display: grid !important;
+                grid-template-columns: repeat(${cols}, 1fr) !important;
+                gap: ${GRID_GAP} !important;
+                width: 100% !important;
+                max-width: none !important;
+                align-content: start !important;
+                box-sizing: border-box !important;
+            }
+            [data-ytpk-popup] #items > *,
+            [data-ytpk-popup] #playlists > *,
+            [data-ytpk-popup] [role="list"] > * {
+                min-width: 0 !important;
+                overflow: hidden !important;
+            }
+        `;
+
+        const style = document.createElement('style');
+        style.setAttribute('data-ytpk-columns', '');
+
+        if (activeContainer.shadowRoot) {
+            style.textContent = shadowCss;
+            activeContainer.shadowRoot.appendChild(style);
+        } else {
+            const parentRoot = activeContainer.getRootNode();
+            if (parentRoot instanceof ShadowRoot) {
+                style.textContent = shadowCss;
+                parentRoot.appendChild(style);
+            } else {
+                style.textContent = globalScopedCss;
+                document.head.appendChild(style);
+            }
+        }
+        activeStyle = style;
+
+        activeContainer.style.setProperty('display', 'grid', 'important');
+        activeContainer.style.setProperty('grid-template-columns', `repeat(${cols}, 1fr)`, 'important');
+        activeContainer.style.setProperty('gap', GRID_GAP, 'important');
+        activeContainer.style.setProperty('align-content', 'start', 'important');
+
+        let finalGridContainer = getGridContainer();
+        if (finalGridContainer && finalGridContainer !== activeContainer) {
+            finalGridContainer.style.setProperty('display', 'grid', 'important');
+            finalGridContainer.style.setProperty('grid-template-columns', `repeat(${cols}, 1fr)`, 'important');
+            finalGridContainer.style.setProperty('gap', GRID_GAP, 'important');
+            finalGridContainer.style.setProperty('width', '100%', 'important');
+            finalGridContainer.style.setProperty('align-content', 'start', 'important');
+            finalGridContainer.style.setProperty('box-sizing', 'border-box', 'important');
+        }
+
+        applySorting(finalGridContainer);
+
+        if (sortObserver) sortObserver.disconnect();
+        sortObserver = new MutationObserver(() => applySorting(finalGridContainer));
+        sortObserver.observe(finalGridContainer, { childList: true });
+
+        if (wheelHandler) {
+            popup.removeEventListener('wheel', wheelHandler, true);
+        }
+        wheelHandler = (e) => {
+            if (scroller && scroller.isConnected) {
+                e.preventDefault();
+                scroller.scrollTop += e.deltaY;
+            }
+        };
+        popup.addEventListener('wheel', wheelHandler, { passive: false, capture: true });
+
+        attachPlaylistClickMonitor(popup);
+        return true;
+    }
+
+    function tryApplyLayout(attempt = 0) {
+        if (!active || !activePopup) return;
+
+        const container = findPlaylistContainer(activePopup);
+        if (container) {
+            activeContainer = container;
+            activeScroller = null;
+            applyColumnLayout();
+
+            activePopup.setAttribute('data-ytpk-ready', 'true');
+            const innerRenderer = activePopup.querySelector('ytd-add-to-playlist-renderer, yt-sheet-view-model');
+            if (innerRenderer) innerRenderer.setAttribute('data-ytpk-ready', 'true');
+
+            requestAnimationFrame(() => { if (active) applyColumnLayout(); });
+            return;
+        }
+
+        if (attempt < 100) {
+            retryTimeout = requestAnimationFrame(() => tryApplyLayout(attempt + 1));
+        } else {
+            activePopup.setAttribute('data-ytpk-ready', 'true');
+        }
+    }
+
+    function cancelRetries() {
+        if (retryTimeout) {
+            cancelAnimationFrame(retryTimeout);
+            retryTimeout = null;
+        }
+    }
+
+    const FORCE_VISIBLE_CSS = `
+        :host { transition: none !important; animation: none !important; }
+        :host([hidden]) { display: block !important; }
+        :host([aria-hidden="true"]) { display: block !important; }
+    `;
+
+    function anchorLock(el) {
+        if (locked.has(el)) return;
+        locked.add(el);
+        for (const m of ['close', 'cancel', 'dismiss', 'hide', 'closeAction_',
+            'closePopupAction_', 'onCloseAction_', 'closeDialog_',
+            'hostClosed', 'handleClose', 'handleDismiss']) {
+            if (typeof el[m] === 'function') {
+                el['__orig_' + m] = el[m];
+                el[m] = function () { if (active) return; return el['__orig_' + m]?.apply(el, arguments); };
+            }
+        }
+        const aObs = new MutationObserver((muts) => {
+            if (!active) return;
+            for (const m of muts) {
+                const t = m.target;
+                if (m.attributeName === 'hidden' && t.hasAttribute('hidden')) t.removeAttribute('hidden');
+                if (m.attributeName === 'aria-hidden' && t.getAttribute('aria-hidden') === 'true') t.removeAttribute('aria-hidden');
+                if (m.attributeName === 'style') {
+                    if (t.style.display === 'none') t.style.display = '';
+                    if (t.style.visibility === 'hidden') t.style.visibility = '';
+                    if (t.style.opacity === '0') t.style.opacity = '';
+                }
+            }
+        });
+        aObs.observe(el, { attributes: true, attributeFilter: ['hidden', 'style', 'aria-hidden'] });
+        observers.push(aObs);
+    }
+
+    function lockElement(el) {
+        if (locked.has(el)) return;
+        locked.add(el);
+        for (const m of ['close', 'cancel', 'dismiss', 'hide', 'closeAction_',
+            'closePopupAction_', 'onCloseAction_', 'closeDialog_',
+            'hostClosed', 'handleClose', 'handleDismiss']) {
+            if (typeof el[m] === 'function') {
+                el['__orig_' + m] = el[m];
+                el[m] = function () { if (active) return; return el['__orig_' + m]?.apply(el, arguments); };
+            }
+        }
+        if (el.shadowRoot && !el.shadowRoot.querySelector('[data-ytpk]')) {
+            const s = document.createElement('style');
+            s.setAttribute('data-ytpk', '');
+            s.textContent = FORCE_VISIBLE_CSS;
+            el.shadowRoot.appendChild(s);
+            el.shadowRoot.querySelectorAll('*').forEach(lockElement);
+            const sObs = new MutationObserver((muts) => {
+                if (!active) return;
+                for (const m of muts) m.addedNodes.forEach(n => { if (n.nodeType === 1) lockElement(n); });
+            });
+            sObs.observe(el.shadowRoot, { childList: true, subtree: true });
+            observers.push(sObs);
+        }
+    }
+
+    function lockTree(root) {
+        let el = root;
+        while (el && el !== document.body) { anchorLock(el); el = el.parentElement; }
+        root.querySelectorAll('*').forEach(lockElement);
+        const lObs = new MutationObserver((muts) => {
+            if (!active) return;
+            for (const m of muts) m.addedNodes.forEach(n => {
+                if (n.nodeType === 1) { lockElement(n); n.querySelectorAll('*').forEach(lockElement); }
+            });
+        });
+        lObs.observe(root, { childList: true, subtree: true });
+        observers.push(lObs);
+    }
+
+    function watchRemoval(popup) {
+        if (!popup.parentElement) return;
+        const rObs = new MutationObserver((muts) => {
+            if (!active) return;
+            for (const m of muts) for (const removed of m.removedNodes) {
+                if (removed === popup || removed.contains?.(popup)) m.target.appendChild(removed);
+            }
+        });
+        rObs.observe(popup.parentElement, { childList: true });
+        observers.push(rObs);
+        if (popup.parentElement?.parentElement) {
+            const rObs2 = new MutationObserver((muts) => {
+                if (!active) return;
+                for (const m of muts) for (const removed of m.removedNodes) {
+                    if (removed.contains?.(popup)) m.target.appendChild(removed);
+                }
+            });
+            rObs2.observe(popup.parentElement.parentElement, { childList: true });
+            observers.push(rObs2);
+        }
+    }
+
+    function blockCloseEvents() {
+        const handler = (e) => {
+            if (!active) return;
+            if (e.type === 'yt-action') {
+                const name = e.detail?.actionName || '';
+                if (!name.includes('close') && !name.includes('dismiss') &&
+                    !name.includes('hide') && !name.includes('collapse')) return;
+            }
+            e.stopPropagation(); e.stopImmediatePropagation();
+            if (e.cancelable) e.preventDefault();
+        };
+        ['iron-overlay-closed', 'iron-overlay-canceled', 'iron-overlay-cancelled',
+         'yt-close-popup-action', 'yt-popup-closed', 'yt-action', 'close', 'cancel']
+        .forEach(evt => { document.addEventListener(evt, handler, true); window.addEventListener(evt, handler, true); });
+    }
+    blockCloseEvents();
+
+    document.addEventListener('click', (e) => {
+        if (!active) return;
+        const popup = getPopup();
+        if (!popup) return;
+        const path = e.composedPath?.() || [];
+        if (path.includes(popup) || popup.contains(e.target)) return;
+        for (const el of path) {
+            const tag = (el.tagName || '').toLowerCase();
+            if (
+                tag === 'tp-yt-paper-toast' ||
+                tag === 'yt-notification-action-renderer' ||
+                tag === 'tp-yt-iron-dropdown' ||
+                tag === 'ytd-popup-container' ||
+                tag === 'ytd-menu-popup-renderer' ||
+                tag === 'ytd-context-menu-section-renderer' ||
+                el.id === 'toast'
+            ) return;
+        }
+        if (e.target.closest?.(
+            'ytd-menu-renderer, yt-icon-button, ytd-compact-video-renderer, ' +
+            'ytd-rich-item-renderer, ytd-video-renderer, ytd-playlist-video-renderer, ' +
+            'tp-yt-paper-icon-button, [aria-label*="More actions"], [aria-label*="Actions"], ' +
+            '[aria-label*="more"], yt-icon, ytd-thumbnail-overlay-toggle-button-renderer'
+        )) return;
+
+        stop();
+    }, false);
+
+    document.addEventListener('click', (e) => {
+        const t = e.target.closest('ytd-button-renderer, yt-button-shape, button, ytd-toggle-button-renderer, ytd-menu-service-item-renderer, tp-yt-paper-item');
+        if (!t) return;
+        const txt = (t.textContent || '').trim().toLowerCase();
+        const aria = (t.getAttribute('aria-label') || '').toLowerCase();
+        if (txt === 'save' || txt === 'guardar' || txt === 'speichern' || txt === 'salvar' ||
+            txt.includes('save to playlist') || txt.includes('guardar en') ||
+            aria.includes('save') || aria.includes('guardar')) {
+            lastTrigger = t;
+            pollForPopup();
+        }
+    }, true);
+
+    function startFallbackMonitor() {
+        if (fallbackInterval) clearInterval(fallbackInterval);
+        fallbackInterval = setInterval(() => {
+            if (!active || reopenCooldown) return;
+            const popup = getPopup();
+            if (popup && popup.getBoundingClientRect().height > 50) return;
+            const trigger = findFreshTrigger();
+            if (!trigger) return;
+            reopenCooldown = true;
+            trigger.click();
+            setTimeout(() => { reopenCooldown = false; }, 800);
+        }, 200);
+    }
+
+    function findFreshTrigger() {
+        for (const btn of document.querySelectorAll('ytd-button-renderer, yt-button-shape, button, ytd-toggle-button-renderer')) {
+            const txt = (btn.textContent || '').trim().toLowerCase();
+            const aria = (btn.getAttribute('aria-label') || '').toLowerCase();
+            if ((txt === 'save' || txt === 'guardar' || txt === 'speichern' || txt === 'salvar' ||
+                aria === 'save to playlist' || aria.includes('guardar en')) &&
+                btn.getBoundingClientRect().width > 0) return btn;
+        }
+        return (lastTrigger && document.contains(lastTrigger)) ? lastTrigger : null;
+    }
+
+    let newBtnEl = null;
+
+    function repositionNewBtn(popup) {
+        if (!newBtnEl || !popup) return;
+        const r = popup.getBoundingClientRect();
+        newBtnEl.style.top  = (r.top + 4) + 'px';
+        newBtnEl.style.left = (r.right - 140) + 'px';
+    }
+
+    function injectButtons(popup) {
+        if (popup.querySelector('.ytpk-close-btn')) return;
+        const target = popup;
+
+        newBtnEl = document.createElement('button');
+        newBtnEl.className = 'ytpk-new-btn';
+        newBtnEl.title = 'Nueva lista / New Playlist';
+        newBtnEl.textContent = '+';
+        repositionNewBtn(popup);
+        newBtnEl.addEventListener('click', (e) => {
+            e.stopPropagation();
+            e.stopImmediatePropagation();
+
+            const footerBtn = document.querySelector(
+                'yt-panel-footer-view-model button-view-model'
+            );
+            let btn = null;
+            if (footerBtn) {
+                btn = footerBtn.shadowRoot
+                    ? footerBtn.shadowRoot.querySelector('button')
+                    : footerBtn.querySelector('button');
+                if (!btn) btn = footerBtn;
+            }
+            if (!btn) return;
+
+            stop();
+            setTimeout(() => {
+                stopCooldown = false;
+                btn.click();
+            }, 50);
+        });
+        document.body.appendChild(newBtnEl);
+
+        const dragObs = new MutationObserver(() => repositionNewBtn(popup));
+        dragObs.observe(popup, { attributes: true, attributeFilter: ['style'] });
+        observers.push(dragObs);
+
+        const searchBox = document.createElement('div');
+        searchBox.className = 'ytpk-search-box';
+        target.appendChild(searchBox);
+
+        const sortBtn = document.createElement('button');
+        sortBtn.className = 'ytpk-sort-btn' + (isAlphabetical ? ' active' : '');
+        sortBtn.title = 'Alternar Orden Alfabético (A-Z)';
+        sortBtn.textContent = 'A-Z';
+        sortBtn.addEventListener('click', (e) => {
+            e.stopPropagation();
+            e.stopImmediatePropagation();
+            isAlphabetical = !isAlphabetical;
+            localStorage.setItem('ytpk_sort_az', isAlphabetical);
+            sortBtn.className = 'ytpk-sort-btn' + (isAlphabetical ? ' active' : '');
+            applySorting(getGridContainer());
+        });
+        target.appendChild(sortBtn);
+
+        const refreshBtn = document.createElement('button');
+        refreshBtn.className = 'ytpk-refresh-btn';
+        refreshBtn.title = 'Actualizar';
+        refreshBtn.textContent = '↻';
+        refreshBtn.addEventListener('click', (e) => { e.stopPropagation(); e.stopImmediatePropagation(); refresh(); });
+        target.appendChild(refreshBtn);
+
+        const closeBtn = document.createElement('button');
+        closeBtn.className = 'ytpk-close-btn';
+        closeBtn.title = 'Cerrar (Esc)';
+        closeBtn.textContent = '✕';
+        closeBtn.addEventListener('click', (e) => { e.stopPropagation(); e.stopImmediatePropagation(); stop(); });
+        target.appendChild(closeBtn);
+    }
+
+    function refresh() {
+        const trigger = findFreshTrigger();
+        if (!trigger) return;
+        stop();
+        setTimeout(() => { stopCooldown = false; trigger.click(); pollForPopup(); }, 200);
+    }
+
+    function start(popup) {
+        if (active) return;
+        if (!hasPlaylistList(popup)) return;
+
+        active = true;
+        setScriptActiveClass(true);
+        activePopup = popup;
+        pendingOpen = false;
+        activeStyle = null;
+        activeContainer = null;
+        activeScroller = null;
+        searchQuery = '';
+
+        lockTree(popup);
+        watchRemoval(popup);
+        injectButtons(popup);
+        startFallbackMonitor();
+
+        cancelRetries();
+        tryApplyLayout();
+        makeDraggable(popup);
+
+        console.log('[YTPK] Popup abierto. Icon lock polling ready.');
+    }
+
+    function stop() {
+        active = false;
+        setScriptActiveClass(false);
+        stopCooldown = true;
+        searchQuery = '';
+        setTimeout(() => { stopCooldown = false; }, 500);
+
+        cancelRetries();
+        stopIconLock();   // ★ stop forcing the icon
+
+        if (activeStyle) { activeStyle.remove(); activeStyle = null; }
+        if (wheelHandler && activePopup) {
+            activePopup.removeEventListener('wheel', wheelHandler, true);
+            wheelHandler = null;
+        }
+        if (sortObserver) {
+            sortObserver.disconnect();
+            sortObserver = null;
+        }
+        observers.forEach(o => o.disconnect());
+        observers.length = 0;
+        if (fallbackInterval) { clearInterval(fallbackInterval); fallbackInterval = null; }
+        if (pollFrame) { cancelAnimationFrame(pollFrame); pollFrame = null; }
+
+        const popup = activePopup;
+        if (popup) {
+            if (popup._ytpkIconUpdater) {
+                popup.removeEventListener('click', popup._ytpkIconUpdater, true);
+                delete popup._ytpkIconUpdater;
+            }
+
+            ['ytpk-close-btn', 'ytpk-refresh-btn', 'ytpk-sort-btn', 'ytpk-search-box'].forEach(cls => {
+                popup.querySelector('.' + cls)?.remove();
+            });
+            newBtnEl?.remove();
+            newBtnEl = null;
+
+            let el = popup;
+            while (el && el !== document.body) {
+                for (const m of ['close', 'cancel', 'dismiss', 'hide', 'closeAction_',
+                    'closePopupAction_', 'onCloseAction_', 'closeDialog_',
+                    'hostClosed', 'handleClose', 'handleDismiss']) {
+                    if (el['__orig_' + m]) { el[m] = el['__orig_' + m]; delete el['__orig_' + m]; }
+                }
+                if (el.shadowRoot) el.shadowRoot.querySelector('[data-ytpk]')?.remove();
+                locked.delete(el);
+                el = el.parentElement;
+            }
+            locked = new WeakSet();
+
+            popup.removeAttribute('data-ytpk-ready');
+            delete popup.dataset.ytpkPopup;
+            const innerRenderer = popup.querySelector('ytd-add-to-playlist-renderer, yt-sheet-view-model');
+            if (innerRenderer) innerRenderer.removeAttribute('data-ytpk-ready');
+
+            const resetStyles = ['position', 'left', 'right', 'top', 'transform', 'zIndex', 'width', 'maxWidth', 'maxHeight', 'boxSizing', 'backgroundColor', 'overflow', 'marginTop', 'marginLeft'];
+            resetStyles.forEach(s => { popup.style[s] = ''; });
+
+            let finalGridContainer = getGridContainer();
+            if (finalGridContainer) {
+                Array.from(finalGridContainer.children).filter(n => n.nodeType === 1).forEach(i => i.style.setProperty('order', '', 'important'));
+            }
+
+            let closed = false;
+            for (const m of ['close', 'cancel', 'dismiss']) {
+                if (typeof popup[m] === 'function') { try { popup[m](); closed = true; break; } catch (_) {} }
+            }
+
+            if (!closed) {
+                let pEl = popup.parentElement;
+                for (let i = 0; i < 10 && pEl; i++) {
+                    for (const m of ['close', 'cancel', 'dismiss']) {
+                        if (typeof pEl[m] === 'function') { try { pEl[m](); closed = true; break; } catch (_) {} }
+                    }
+                    if (closed) break;
+                    pEl = pEl.parentElement;
+                }
+            }
+        }
+        activePopup = null;
+        activeStyle = null;
+        activeContainer = null;
+        activeScroller = null;
+    }
+
+    window.addEventListener('yt-navigate-start', () => {
+        if (active) stop();
+        stopCooldown = false;
+        lastTrigger = null;
+        navigationLockUntil = Date.now() + 1500;
+    });
+    window.addEventListener('yt-page-data-updated', () => {
+        if (active) stop();
+        stopCooldown = false;
+        navigationLockUntil = Date.now() + 1500;
+    });
+
+    function pollForPopup() {
+        if (active || stopCooldown) return;
+        if (Date.now() < navigationLockUntil) return;
+        if (pollFrame) cancelAnimationFrame(pollFrame);
+
+        let attempts = 0;
+        const check = () => {
+            attempts++;
+            const p = getPopup();
+            if (p && !active && !stopCooldown && Date.now() >= navigationLockUntil && hasPlaylistList(p)) {
+                start(p);
+            } else if (attempts < 100 && !active && !stopCooldown && Date.now() >= navigationLockUntil) {
+                pollFrame = requestAnimationFrame(check);
+            }
+        };
+        pollFrame = requestAnimationFrame(check);
+    }
+
+    const mainObs = new MutationObserver(() => {
+        if (active || stopCooldown) return;
+        if (Date.now() < navigationLockUntil) return;
+        const popup = getPopup();
+        if (popup && hasPlaylistList(popup)) start(popup);
+    });
+    mainObs.observe(document.body, { childList: true, subtree: true });
+
+    // ── GHOST SEARCHBAR INPUT LISTENER ────────────────────────────
+    document.addEventListener('keydown', (e) => {
+        const tag = document.activeElement?.tagName?.toLowerCase();
+        if (tag === 'input' || tag === 'textarea' || document.activeElement?.isContentEditable) return;
+
+        const isCtrlOrCmd = e.ctrlKey || e.metaKey;
+        if (e.altKey) return;
+        if (isCtrlOrCmd) {
+            if (e.key === 'Backspace' || e.key === 'a' || e.key === 'A' || e.key === 'x' || e.key === 'X') {
+                // allowed
+            } else {
+                return;
+            }
+        }
+
+        if (!active) {
+            if ((e.key === 'e' || e.key === 'E') && !pendingOpen && !e.ctrlKey && !e.altKey && !e.metaKey) {
+                e.stopPropagation(); e.stopImmediatePropagation(); e.preventDefault();
+                pendingOpen = true; stopCooldown = false;
+                window.scrollTo({ top: 0, behavior: 'instant' });
+                const trigger = findFreshTrigger();
+                if (trigger) { trigger.click(); pollForPopup(); }
+                setTimeout(() => { pendingOpen = false; }, 1000);
+            }
+            return;
+        }
+
+        if (isCtrlOrCmd && (e.key === 'a' || e.key === 'A')) {
+            e.preventDefault();
+            e.stopPropagation();
+            const box = activePopup?.querySelector('.ytpk-search-box');
+            if (box) {
+                const selection = window.getSelection();
+                selection.removeAllRanges();
+                const range = document.createRange();
+                range.selectNodeContents(box);
+                selection.addRange(range);
+            }
+            return;
+        }
+
+        if (isCtrlOrCmd && (e.key === 'x' || e.key === 'X')) {
+            const box = activePopup?.querySelector('.ytpk-search-box');
+            if (box) {
+                const selection = window.getSelection();
+                if (selection.rangeCount > 0) {
+                    const range = selection.getRangeAt(0);
+                    if (box.contains(range.commonAncestorContainer)) {
+                        e.preventDefault();
+                        e.stopPropagation();
+                        searchQuery = '';
+                        updateSearchUI();
+                        applySorting(getGridContainer());
+                        selection.removeAllRanges();
+                        return;
+                    }
+                }
+            }
+        }
+
+        if (e.key === 'Escape') {
+            e.stopPropagation(); e.stopImmediatePropagation(); e.preventDefault();
+            if (searchQuery.length > 0) {
+                searchQuery = '';
+                updateSearchUI();
+                applySorting(getGridContainer());
+            } else {
+                stop();
+            }
+            return;
+        }
+
+        if (e.key === 'Backspace') {
+            e.stopPropagation(); e.stopImmediatePropagation(); e.preventDefault();
+            if (e.ctrlKey) {
+                searchQuery = searchQuery.replace(/\S+\s*$/, '');
+            } else {
+                searchQuery = searchQuery.slice(0, -1);
+            }
+            updateSearchUI();
+            applySorting(getGridContainer());
+            return;
+        }
+
+        if (e.key.length === 1 && e.key.match(/[\w\s\d]/) && !e.ctrlKey && !e.altKey && !e.metaKey) {
+            if (e.key === ' ') e.preventDefault();
+            e.stopPropagation(); e.stopImmediatePropagation(); e.preventDefault();
+            searchQuery += e.key.toLowerCase();
+            updateSearchUI();
+            applySorting(getGridContainer());
+            return;
+        }
+
+    }, true);
+
+    console.log('[YTPK] v8.32 listo. Icon lock via polling active.');
+})();
