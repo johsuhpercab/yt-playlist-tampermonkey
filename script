@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         YouTube - Keep Save to Playlist Popup Open (3 cols, DRAGGABLE, A-Z, TYPE-TO-SEARCH)
 // @namespace    http://tampermonkey.net/
-// @version      8.33
-// @description  3 cols. Draggable! A-Z Toggle. Ghost Searchbar (Ctrl+Backspace/A/X). + New Playlist button. Icon stays "Saved" via polling. Fixed duplicate outer scrollbar.
+// @version      8.35
+// @description  3 cols. Draggable! A-Z Toggle. Ghost Searchbar (Ctrl+Backspace/A/X). + New Playlist button. Icon stays "Saved" via polling. Fixed duplicate outer scrollbar + top-clip + open flash.
 // @author       Antigravity (Upgraded by Gemini, fixed by Claude)
 // @match        https://www.youtube.com/*
 // @match        https://youtube.com/*
@@ -37,6 +37,7 @@
     let sortObserver = null;
     let navigationLockUntil = 0;
     let iconLockInterval = null;   // ★ polling loop to force "Saved" icon
+    let overflowLocked = new WeakSet(); // ★ ancestors already overflow-locked (avoid re-touching styles → avoids flash/resize)
 
     // Guardar preferencia de usuario
     let isAlphabetical = localStorage.getItem('ytpk_sort_az') === 'true';
@@ -514,10 +515,23 @@
             parent.style.setProperty('width', '100%', 'important');
             parent.style.setProperty('max-width', 'none', 'important');
             parent.style.setProperty('box-sizing', 'border-box', 'important');
-            // ★ Prevent any wrapper element between the popup and the real
-            // playlist scroller from growing its own scrollbar.
-            parent.style.setProperty('overflow', 'hidden', 'important');
-            parent.classList.add('ytpk-hide-scrollbar');
+            if (!overflowLocked.has(parent)) {
+                // ★ Prevent any wrapper element between the popup and the real
+                // playlist scroller from growing its own scrollbar. Only done
+                // once per element — repeating this on every re-layout call
+                // (e.g. the follow-up requestAnimationFrame pass) caused a
+                // visible flash/resize as space reserved for a native
+                // scrollbar got reclaimed after the popup was already shown.
+                parent.style.setProperty('overflow', 'hidden', 'important');
+                parent.classList.add('ytpk-hide-scrollbar');
+                // ★ If this wrapper was already scrolled (e.g. left over from
+                // a previous render) it would now be stuck that way since it
+                // can no longer show a scrollbar to get back — reset it so
+                // nothing is clipped off-screen at the top/left.
+                if (parent.scrollTop !== 0) parent.scrollTop = 0;
+                if (parent.scrollLeft !== 0) parent.scrollLeft = 0;
+                overflowLocked.add(parent);
+            }
             parent = parent.parentElement || (parent.parentNode?.host || null);
         }
 
@@ -532,8 +546,16 @@
         popup.style.backgroundColor = 'var(--yt-spec-base-background, #212121)';
         // ★ The popup itself must never scroll/show a scrollbar — only the
         // inner list scroller (below) is allowed to.
-        popup.style.setProperty('overflow', 'hidden', 'important');
-        popup.classList.add('ytpk-hide-scrollbar');
+        // ★ The popup itself must never scroll/show a scrollbar — only the
+        // inner list scroller (below) is allowed to. Applied once, same
+        // reasoning as the ancestor loop above (avoids flash/resize).
+        if (!overflowLocked.has(popup)) {
+            popup.style.setProperty('overflow', 'hidden', 'important');
+            popup.classList.add('ytpk-hide-scrollbar');
+            if (popup.scrollTop !== 0) popup.scrollTop = 0;
+            if (popup.scrollLeft !== 0) popup.scrollLeft = 0;
+            overflowLocked.add(popup);
+        }
 
         scroller.style.setProperty('max-height', 'calc(' + POPUP_MAX_HEIGHT + ' - 60px)', 'important');
         scroller.style.setProperty('overflow-y', 'auto', 'important');
@@ -1021,6 +1043,7 @@
                 el = el.parentElement;
             }
             locked = new WeakSet();
+            overflowLocked = new WeakSet();
 
             popup.removeAttribute('data-ytpk-ready');
             delete popup.dataset.ytpkPopup;
@@ -1190,5 +1213,5 @@
 
     }, true);
 
-    console.log('[YTPK] v8.33 listo. Icon lock via polling active. Outer scrollbar fix applied.');
+    console.log('[YTPK] v8.35 listo. Icon lock via polling active. Outer scrollbar + top-clip + open-flash fix applied.');
 })();
