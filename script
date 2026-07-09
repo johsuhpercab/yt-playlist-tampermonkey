@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         YouTube - Keep Save to Playlist Popup Open (3 cols, DRAGGABLE, A-Z, TYPE-TO-SEARCH)
 // @namespace    http://tampermonkey.net/
-// @version      8.32
-// @description  3 cols. Draggable! A-Z Toggle. Ghost Searchbar (Ctrl+Backspace/A/X). + New Playlist button. Icon stays "Saved" via polling.
+// @version      8.33
+// @description  3 cols. Draggable! A-Z Toggle. Ghost Searchbar (Ctrl+Backspace/A/X). + New Playlist button. Icon stays "Saved" via polling. Fixed duplicate outer scrollbar.
 // @author       Antigravity (Upgraded by Gemini, fixed by Claude)
 // @match        https://www.youtube.com/*
 // @match        https://youtube.com/*
@@ -121,6 +121,19 @@
             border: 1px solid rgba(255,255,255,0.2);
             box-shadow: 0 2px 10px rgba(0,0,0,0.5);
             user-select: text;
+        }
+
+        /* ★ Hides the (unwanted) outer scrollbar on the popup itself and on any
+           wrapper element between the popup and the real playlist scroller.
+           The inner list scroller keeps its own scrollbar/behavior untouched. */
+        .ytpk-hide-scrollbar {
+            scrollbar-width: none !important;
+            -ms-overflow-style: none !important;
+        }
+        .ytpk-hide-scrollbar::-webkit-scrollbar {
+            display: none !important;
+            width: 0 !important;
+            height: 0 !important;
         }
     `);
 
@@ -501,6 +514,10 @@
             parent.style.setProperty('width', '100%', 'important');
             parent.style.setProperty('max-width', 'none', 'important');
             parent.style.setProperty('box-sizing', 'border-box', 'important');
+            // ★ Prevent any wrapper element between the popup and the real
+            // playlist scroller from growing its own scrollbar.
+            parent.style.setProperty('overflow', 'hidden', 'important');
+            parent.classList.add('ytpk-hide-scrollbar');
             parent = parent.parentElement || (parent.parentNode?.host || null);
         }
 
@@ -513,7 +530,10 @@
         popup.style.maxHeight = POPUP_MAX_HEIGHT;
         popup.style.boxSizing = 'border-box';
         popup.style.backgroundColor = 'var(--yt-spec-base-background, #212121)';
-        popup.style.overflow = 'hidden';
+        // ★ The popup itself must never scroll/show a scrollbar — only the
+        // inner list scroller (below) is allowed to.
+        popup.style.setProperty('overflow', 'hidden', 'important');
+        popup.classList.add('ytpk-hide-scrollbar');
 
         scroller.style.setProperty('max-height', 'calc(' + POPUP_MAX_HEIGHT + ' - 60px)', 'important');
         scroller.style.setProperty('overflow-y', 'auto', 'important');
@@ -996,6 +1016,7 @@
                     if (el['__orig_' + m]) { el[m] = el['__orig_' + m]; delete el['__orig_' + m]; }
                 }
                 if (el.shadowRoot) el.shadowRoot.querySelector('[data-ytpk]')?.remove();
+                el.classList?.remove('ytpk-hide-scrollbar');
                 locked.delete(el);
                 el = el.parentElement;
             }
@@ -1169,5 +1190,5 @@
 
     }, true);
 
-    console.log('[YTPK] v8.32 listo. Icon lock via polling active.');
+    console.log('[YTPK] v8.33 listo. Icon lock via polling active. Outer scrollbar fix applied.');
 })();
